@@ -69,7 +69,7 @@ export default function SurveyBoard() {
   const deleteSurvey = useSurveyStore((state) => state.deleteSurvey);
   const surveyRevision = useSurveyStore((state) => state.revision);
 
-  const { rows, loading, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
+  const { rows, loading } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Survey | null>(null);
@@ -158,10 +158,12 @@ export default function SurveyBoard() {
         message.success(`已录入第 ${row.round} 测次，成活率 ${row.survivalRate}%`);
         if (row.survivalRate < SURVIVAL_WARN_RATE) {
           message.warning(`成活率 ${row.survivalRate}% 低于告警阈值 ${SURVIVAL_WARN_RATE}%，建议生成补植计划`, 6);
+        } else {
+          message.success('测次成活株数已按在库领用摊回苗木批次，保证率差额（如有）已记入结算单');
         }
       } else {
         await updateSurvey(editing.id, payload);
-        message.success('验收记录已更新');
+        message.success('验收记录已更新；批次成活率与结算单已按新测次重算');
       }
       setOpen(false);
     } catch (error) {
@@ -287,8 +289,7 @@ export default function SurveyBoard() {
             cancelText="取消"
             onConfirm={async () => {
               await deleteSurvey(record.id);
-              await remove(record.id);
-              message.success('验收记录已删除');
+              message.success('验收记录已删除；相关批次结算单已同步重算');
             }}
           >
             <Button size="small" type="link" danger icon={<DeleteOutlined />}>
@@ -345,6 +346,14 @@ export default function SurveyBoard() {
           }
         />
       ) : null}
+
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 14 }}
+        message="项目部侧按整块地验收；测次成活株数自动摊回苗圃批次"
+        description="这里的成活株数只按整块地块登记。保存测次后，系统按各批次「在库领用」株数摊回成活株数、算出批次成活率；低于苗圃供苗保证率的差额自动记入结算单（挂起领用不参与摊回），可到「批次对账与结算」页确认。"
+      />
 
       <Card
         title="成活率与株高验收台"
@@ -491,7 +500,8 @@ export default function SurveyBoard() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            成活率 = 成活株数 / 该地块栽植总株数，保存时自动计算；成活率低于 {SURVIVAL_WARN_RATE}% 会给出告警提示。
+            成活率 = 成活株数 / 该地块栽植总株数（含挂起），保存时自动计算；挂起领用不参与按批次摊回。
+            低于 {SURVIVAL_WARN_RATE}% 会给出补植告警；低于某批次供苗保证率的差额会自动记入结算单，等项目部确认。
           </Typography.Text>
         </Form>
       </Modal>

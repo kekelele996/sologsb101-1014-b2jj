@@ -201,6 +201,16 @@ export default function PlotList() {
       render: (_value, record) => `${statOf(record.id).plantTotal.toLocaleString('zh-CN')} 株`,
     },
     {
+      title: '挂起领用',
+      key: 'pendingCount',
+      width: 100,
+      align: 'right',
+      render: (_value, record) => {
+        const pending = statOf(record.id).pendingCount;
+        return pending > 0 ? <Tag color="orange">{pending.toLocaleString('zh-CN')} 株</Tag> : <span>0 株</span>;
+      },
+    },
+    {
       title: '验收测次',
       key: 'surveyCount',
       width: 96,
@@ -348,7 +358,7 @@ export default function PlotList() {
             loading={!ready}
             columns={columns}
             dataSource={rows}
-            scroll={{ x: 1480 }}
+            scroll={{ x: 1580 }}
             pagination={{ pageSize: 8, showSizeChanger: false }}
             locale={{
               emptyText: (

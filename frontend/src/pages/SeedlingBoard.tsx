@@ -1,7 +1,8 @@
 /**
- * /plots/:id/seedlings 苗木批次与来源登记
- * 按地块登记苗木批次，校验批次累计数量与地块面积是否匹配。
- * 消费模型：Seedling、Plot；复用组件：<StatBadge>、<EmptyPanel>
+ * /plots/:id/seedlings 苗木批次台账（苗圃侧）
+ * 苗圃只登记：进场数量与供苗保证率（自育苗可不考核，外购默认八成）。
+ * 成活株数由项目部验收测次按领用摊回，最新批次成活率与对账数量只展示、不可在此编辑。
+ * 消费模型：Seedling、Planting；复用组件：<StatBadge>、<EmptyPanel>
  */
 import { useMemo, useState } from 'react';
 import {
@@ -9,6 +10,7 @@ import {
   App,
   Button,
   Card,
+  Checkbox,
   DatePicker,
   Form,
   Input,
@@ -19,6 +21,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -27,16 +30,21 @@ import dayjs, { type Dayjs } from 'dayjs';
 import { useNavigate, useParams } from 'react-router-dom';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
-import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
-import { db } from '../utils/db';
 import {
+  defaultGuaranteeRate,
+  guaranteeRateText,
+  GUARANTEE_RATE_MAX,
+  GUARANTEE_RATE_MIN,
+  PURCHASED_DEFAULT_GUARANTEE_RATE,
   SEEDLING_SOURCE_OPTIONS,
   SEEDLING_SPECIES_OPTIONS,
+  type GuaranteeRate,
   type Seedling,
   type SeedlingSource,
   type SeedlingSpecies,
 } from '../types/seedling';
+import { saveSeedling, removeSeedling } from '../utils/db';
 import { ROUTES } from '../router';
 import { muToM2, round1 } from '../utils/rate';
 
@@ -46,6 +54,9 @@ interface SeedlingFormValues {
   spec: string;
   quantity: number;
   arrivalDate: Dayjs;
+  /** 勾选 = 不考核（自育苗默认勾选）；取消勾选时按 guaranteeInput 考核 */
+  exempt: boolean;
+  guaranteeInput: number;
 }
 
 /** 参考密度：每平方米不超过 2 株（约 0.5 ㎡/株），用于批次数量提示 */
@@ -58,7 +69,9 @@ export default function SeedlingBoard() {
   const ready = usePlotStore((state) => state.ready);
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
   const plantings = usePlotStore((state) => state.plantings);
-  const { rows, loading, create, update, remove } = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
+  const seedlings = usePlotStore((state) => state.seedlings);
+  const reconcile = usePlotStore((state) => state.reconcile);
+  const refreshCounts = usePlotStore((state) => state.refreshCounts);
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Seedling | null>(null);
@@ -66,14 +79,13 @@ export default function SeedlingBoard() {
   const [form] = Form.useForm<SeedlingFormValues>();
 
   const plotSeedlings = useMemo(
-    () => rows.filter((row) => row.plotId === id).sort((a, b) => b.arrivalDate.localeCompare(a.arrivalDate)),
-    [rows, id],
+    () => seedlings.filter((row) => row.plotId === id).sort((a, b) => b.arrivalDate.localeCompare(a.arrivalDate)),
+    [seedlings, id],
   );
 
   const totalQuantity = plotSeedlings.reduce((acc, row) => acc + row.quantity, 0);
-  const usedQuantity = plantings
-    .filter((row) => row.plotId === id)
-    .reduce((acc, row) => acc + row.count, 0);
+  const committedQuantity = plotSeedlings.reduce((acc, row) => acc + (reconcile[row.id]?.committed ?? 0), 0);
+  const pendingQuantity = plotSeedlings.reduce((acc, row) => acc + (reconcile[row.id]?.pending ?? 0), 0);
 
   const density = plot ? round1(totalQuantity / Math.max(1, muToM2(plot.areaMu))) : 0;
   const overloaded = plot !== undefined && density > MAX_PLANTS_PER_M2;
@@ -86,6 +98,8 @@ export default function SeedlingBoard() {
       spec: '50cm 裸根苗',
       quantity: 1000,
       arrivalDate: dayjs(),
+      exempt: true,
+      guaranteeInput: PURCHASED_DEFAULT_GUARANTEE_RATE,
     });
     setOpen(true);
   };
@@ -98,8 +112,21 @@ export default function SeedlingBoard() {
       spec: row.spec,
       quantity: row.quantity,
       arrivalDate: dayjs(row.arrivalDate),
+      exempt: row.guaranteeRate === null,
+      guaranteeInput: row.guaranteeRate ?? PURCHASED_DEFAULT_GUARANTEE_RATE,
     });
     setOpen(true);
+  };
+
+  const handleValuesChange = (changed: Partial<SeedlingFormValues>): void => {
+    // 切换来源时自动给一个保证率默认值：自育苗不考核，外购八成
+    if (changed.source !== undefined) {
+      const next = defaultGuaranteeRate(changed.source);
+      form.setFieldsValue({
+        exempt: next === null,
+        guaranteeInput: next ?? PURCHASED_DEFAULT_GUARANTEE_RATE,
+      });
+    }
   };
 
   const handleSubmit = async (): Promise<void> => {
@@ -107,21 +134,25 @@ export default function SeedlingBoard() {
     try {
       const values = await form.validateFields();
       setSubmitting(true);
-      const payload = {
-        plotId: id,
-        species: values.species,
-        source: values.source,
-        spec: values.spec.trim(),
-        quantity: values.quantity,
-        arrivalDate: values.arrivalDate.format('YYYY-MM-DD'),
-      };
-      if (editing === null) {
-        await create(payload, 'seedling');
-        message.success(`已登记苗木批次：${payload.species} ${payload.quantity} 株`);
-      } else {
-        await update(editing.id, payload);
-        message.success('苗木批次已更新');
-      }
+      const guaranteeRate: GuaranteeRate = values.exempt ? null : values.guaranteeInput;
+      const row = await saveSeedling({
+        id: editing?.id,
+        draft: {
+          plotId: id,
+          species: values.species,
+          source: values.source,
+          spec: values.spec.trim(),
+          quantity: values.quantity,
+          guaranteeRate,
+          arrivalDate: values.arrivalDate.format('YYYY-MM-DD'),
+        },
+      });
+      message.success(
+        editing === null
+          ? `已登记苗木批次：${row.species} ${row.quantity} 株，供苗保证率 ${guaranteeRateText(row.guaranteeRate)}`
+          : '苗木批次已更新，领用在库 / 挂起状态已按新进场数量重算',
+      );
+      await refreshCounts();
       setOpen(false);
     } catch (error) {
       if (error instanceof Error) message.error(error.message);
@@ -132,14 +163,15 @@ export default function SeedlingBoard() {
 
   const handleDelete = async (row: Seedling): Promise<void> => {
     const bound = plantings.filter((item) => item.seedlingId === row.id).length;
-    await remove(row.id);
+    await removeSeedling(row.id);
+    await refreshCounts();
     message.success(
-      bound > 0 ? `已删除批次（同时清理了 ${bound} 条引用它的栽植记录）` : '已删除苗木批次',
+      bound > 0 ? `已删除批次（同时清理了 ${bound} 条引用它的栽植记录与相关结算单）` : '已删除苗木批次',
     );
   };
 
   if (!ready) {
-    return <Card loading title="苗木批次与来源登记" />;
+    return <Card loading title="苗木批次台账（苗圃侧）" />;
   }
 
   if (plot === undefined) {
@@ -163,19 +195,19 @@ export default function SeedlingBoard() {
       title: '树种',
       dataIndex: 'species',
       key: 'species',
-      width: 120,
+      width: 110,
       render: (value: string) => <Tag color="green">{value}</Tag>,
     },
     {
       title: '来源',
       dataIndex: 'source',
       key: 'source',
-      width: 100,
+      width: 90,
       render: (value: string) => <Tag color={value === '自育苗' ? 'cyan' : 'gold'}>{value}</Tag>,
     },
-    { title: '规格', dataIndex: 'spec', key: 'spec', width: 160 },
+    { title: '规格', dataIndex: 'spec', key: 'spec', width: 150 },
     {
-      title: '数量（株）',
+      title: '进场数量（株）',
       dataIndex: 'quantity',
       key: 'quantity',
       width: 120,
@@ -184,27 +216,73 @@ export default function SeedlingBoard() {
       render: (value: number) => value.toLocaleString('zh-CN'),
     },
     {
-      title: '已栽植（株）',
-      key: 'used',
-      width: 120,
+      title: '供苗保证率',
+      dataIndex: 'guaranteeRate',
+      key: 'guaranteeRate',
+      width: 110,
+      align: 'center',
+      render: (value: GuaranteeRate) =>
+        value === null ? <Tag>不考核</Tag> : <Tag color="geekblue">{value}%</Tag>,
+    },
+    {
+      title: '已在库领用（株）',
+      key: 'committed',
+      width: 130,
       align: 'right',
-      render: (_value, record) =>
-        plantings
-          .filter((item) => item.seedlingId === record.id)
-          .reduce((acc, item) => acc + item.count, 0)
-          .toLocaleString('zh-CN'),
+      render: (_value, record) => (reconcile[record.id]?.committed ?? 0).toLocaleString('zh-CN'),
+    },
+    {
+      title: '挂起（株）',
+      key: 'pending',
+      width: 100,
+      align: 'right',
+      render: (_value, record) => {
+        const pending = reconcile[record.id]?.pending ?? 0;
+        return pending > 0 ? <Tag color="orange">{pending.toLocaleString('zh-CN')}</Tag> : <span>0</span>;
+      },
+    },
+    {
+      title: '摊回成活率 / 保证率',
+      key: 'batchRate',
+      width: 200,
+      render: (_value, record) => {
+        const item = reconcile[record.id];
+        if (!item || !item.latest) return <Typography.Text type="secondary">暂无验收</Typography.Text>;
+        const latest = item.latest;
+        const short = latest.shortRate > 0;
+        return (
+          <Space direction="vertical" size={0}>
+            <Space size={4}>
+              <Tooltip title={`第 ${latest.round} 测次（${latest.date}）成活株数按领用摊回`}>
+                <Tag color={short ? 'red' : 'green'} style={{ marginInlineEnd: 0 }}>
+                  {latest.rate.toFixed(1)}%
+                </Tag>
+              </Tooltip>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                / {guaranteeRateText(item.guaranteeRate)}
+              </Typography.Text>
+            </Space>
+            {short ? (
+              <Typography.Text type="danger" style={{ fontSize: 12 }}>
+                差 {latest.shortRate.toFixed(1)} 点 · {latest.shortCount} 株
+              </Typography.Text>
+            ) : null}
+          </Space>
+        );
+      },
     },
     {
       title: '进场日期',
       dataIndex: 'arrivalDate',
       key: 'arrivalDate',
-      width: 130,
+      width: 110,
       sorter: (a, b) => a.arrivalDate.localeCompare(b.arrivalDate),
     },
     {
       title: '操作',
       key: 'action',
-      width: 170,
+      width: 150,
+      fixed: 'right',
       render: (_value, record) => (
         <Space size={4}>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
@@ -212,7 +290,7 @@ export default function SeedlingBoard() {
           </Button>
           <Popconfirm
             title="确认删除该苗木批次？"
-            description="引用该批次的栽植记录会被一并清理。"
+            description="引用该批次的栽植记录与相关结算单会被一并清理。"
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
@@ -244,15 +322,31 @@ export default function SeedlingBoard() {
         </Typography.Text>
       </Space>
 
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 14 }}
+        message="苗圃侧台账：只管进场数量与供苗保证率"
+        description="成活率由项目部按整块地做验收测次，再按领用摊回本批；低于保证率的差额会自动生成结算单，等项目部确认。自育苗可登记为「不考核」，外购默认按八成登记。"
+      />
+
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="苗木批次" value={plotSeedlings.length} suffix="批" tone="primary" />
         <StatBadge label="进场苗木合计" value={totalQuantity.toLocaleString('zh-CN')} suffix="株" tone="info" />
         <StatBadge
-          label="已栽植"
-          value={usedQuantity.toLocaleString('zh-CN')}
+          label="已在库领用"
+          value={committedQuantity.toLocaleString('zh-CN')}
           suffix="株"
-          percent={totalQuantity > 0 ? (usedQuantity / totalQuantity) * 100 : 0}
+          percent={totalQuantity > 0 ? (committedQuantity / totalQuantity) * 100 : 0}
           tone="success"
+          hint="领用累计未超进场数量的部分，参与测次成活株数摊回"
+        />
+        <StatBadge
+          label="挂起领用"
+          value={pendingQuantity.toLocaleString('zh-CN')}
+          suffix="株"
+          tone={pendingQuantity > 0 ? 'danger' : 'default'}
+          hint="超出进场数量的领用先挂起，不参与摊回；苗圃补足进场数量后自动恢复在库"
         />
         <StatBadge
           label="批次密度"
@@ -274,17 +368,17 @@ export default function SeedlingBoard() {
       ) : null}
 
       <Card
-        title="苗木批次与来源"
+        title="苗木批次与供苗保证率"
         extra={
           <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
             登记苗木批次
           </Button>
         }
       >
-        {plotSeedlings.length === 0 && !loading ? (
+        {plotSeedlings.length === 0 ? (
           <EmptyPanel
             title="该地块还没有苗木批次"
-            description="登记进场苗木的树种、来源、规格与数量，栽植记录才能引用到具体批次。"
+            description="苗圃在此登记进场苗木的树种、来源、规格、进场数量与供苗保证率，项目部领用栽植时只能挑在库批次。"
             actionText="登记第一批苗木"
             onAction={openCreate}
           />
@@ -292,16 +386,16 @@ export default function SeedlingBoard() {
           <Table<Seedling>
             rowKey="id"
             size="middle"
-            loading={loading}
             columns={columns}
             dataSource={plotSeedlings}
+            scroll={{ x: 1400 }}
             pagination={false}
           />
         )}
       </Card>
 
       <Modal
-        title={editing === null ? '登记苗木批次' : '编辑苗木批次'}
+        title={editing === null ? '登记苗木批次（苗圃侧）' : '编辑苗木批次'}
         open={open}
         onCancel={() => setOpen(false)}
         onOk={() => void handleSubmit()}
@@ -309,7 +403,7 @@ export default function SeedlingBoard() {
         okText="保存"
         cancelText="取消"
       >
-        <Form form={form} layout="vertical">
+        <Form form={form} layout="vertical" onValuesChange={(changed) => handleValuesChange(changed)}>
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item name="species" label="树种" style={{ flex: 1 }} rules={[{ required: true }]}>
               <Select options={SEEDLING_SPECIES_OPTIONS.map((value) => ({ value, label: value }))} />
@@ -324,7 +418,7 @@ export default function SeedlingBoard() {
           <Space size={12} style={{ display: 'flex' }}>
             <Form.Item
               name="quantity"
-              label="数量（株）"
+              label="进场数量（株）"
               style={{ flex: 1 }}
               rules={[{ required: true, message: '请填写数量' }]}
             >
@@ -339,8 +433,43 @@ export default function SeedlingBoard() {
               <DatePicker style={{ width: '100%' }} />
             </Form.Item>
           </Space>
+
+          <Form.Item label="供苗保证率" style={{ marginBottom: 6 }}>
+            <Space size={12} wrap>
+              <Form.Item name="exempt" valuePropName="checked" noStyle>
+                <Checkbox>不考核（自育苗）</Checkbox>
+              </Form.Item>
+              <Form.Item
+                noStyle
+                shouldUpdate={(prev, next) => prev.exempt !== next.exempt}
+              >
+                {({ getFieldValue }) =>
+                  getFieldValue('exempt') ? (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      该批次不参与结算差额考核
+                    </Typography.Text>
+                  ) : (
+                    <Space size={6}>
+                      <Form.Item name="guaranteeInput" noStyle rules={[{ required: true }]}>
+                        <InputNumber
+                          min={GUARANTEE_RATE_MIN}
+                          max={GUARANTEE_RATE_MAX}
+                          step={1}
+                          style={{ width: 110 }}
+                          addonAfter="%"
+                        />
+                      </Form.Item>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        外购默认 {PURCHASED_DEFAULT_GUARANTEE_RATE}%，低于该保证率的差额将进结算单
+                      </Typography.Text>
+                    </Space>
+                  )
+                }
+              </Form.Item>
+            </Space>
+          </Form.Item>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            保存后可在栽植记录页引用该批次，登记株距与株数。
+            保存后，项目部已登记的领用会按新进场数量重算在库 / 挂起；测次成活株数按在库领用摊回本批。
           </Typography.Text>
         </Form>
       </Modal>

@@ -1,14 +1,21 @@
 /**
  * 演示数据播种（幂等）
- * 父 → 子 → 孙三层链路：地块 → 苗木批次 / 栽植 → 验收 → 补植
+ * 父 → 子 → 孙三层链路：地块 → 苗木批次 / 栽植 → 验收 → 补植 / 结算
  * 所有 id 固定，保证 /plots/:id/seedlings、/plots/:id/plantings 深链一定命中真实数据。
+ *
+ * 两侧分账演示点：
+ * - 自育苗批次保证率为「不考核」，外购批次按八成（80%）登记；
+ * - 北屿 c1 批次进场 4000 株、领用 4200 株，超出部分「挂起」；
+ * - 东港 a2 批次第 3 测次 79.0% < 80%，存在一条「待确认」结算单；
+ * - 西湾 b2 批次第 2 测次 64.0% < 80%，存在一条「已确认」结算单。
  */
 import { db, ROW_REVISION } from './db';
 import type { Plot } from '../types/plot';
 import type { Seedling } from '../types/seedling';
-import type { Planting } from '../types/planting';
+import type { Planting, PlantingStatus } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant } from '../types/replant';
+import type { Settlement } from '../types/settlement';
 import { calcSurvivalRate, rateLevel } from './rate';
 
 const SEED_TIME = '2025-01-06T02:00:00.000Z';
@@ -28,8 +35,20 @@ function seedlingRow(row: Omit<Seedling, 'createdAt' | 'updatedAt' | 'revision'>
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
-function plantingRow(row: Omit<Planting, 'createdAt' | 'updatedAt' | 'revision'>): Planting {
-  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+function plantingRow(
+  row: Omit<Planting, 'createdAt' | 'updatedAt' | 'revision' | 'status' | 'overQuantity'> & {
+    status?: PlantingStatus;
+    overQuantity?: number;
+  },
+): Planting {
+  return {
+    ...row,
+    status: row.status ?? 'active',
+    overQuantity: row.overQuantity ?? 0,
+    createdAt: SEED_TIME,
+    updatedAt: SEED_TIME,
+    revision: ROW_REVISION,
+  };
 }
 
 function surveyRow(row: Omit<Survey, 'createdAt' | 'updatedAt' | 'revision' | 'grade' | 'gradeManual' | 'survivalRate'>, total: number): Survey {
@@ -46,6 +65,10 @@ function surveyRow(row: Omit<Survey, 'createdAt' | 'updatedAt' | 'revision' | 'g
 }
 
 function replantRow(row: Omit<Replant, 'createdAt' | 'updatedAt' | 'revision'>): Replant {
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+}
+
+function settlementRow(row: Omit<Settlement, 'createdAt' | 'updatedAt' | 'revision'>): Settlement {
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
@@ -94,14 +117,15 @@ export async function seedDatabase(): Promise<void> {
     }),
   ];
 
-  // ---------------- 苗木批次（每地块 2 批） ----------------
+  // ---------------- 苗木批次（每地块 2 批；自育苗不考核，外购保证率八成） ----------------
   const seedlings: Seedling[] = [
-    seedlingRow({ id: 'seedling-a1', plotId: SEED_IDS.plotA, species: '秋茄', source: '自育苗', spec: '50cm 裸根苗', quantity: 3200, arrivalDate: '2024-04-05' }),
-    seedlingRow({ id: 'seedling-a2', plotId: SEED_IDS.plotA, species: '桐花树', source: '外购', spec: '40cm 营养袋苗', quantity: 2400, arrivalDate: '2024-04-10' }),
-    seedlingRow({ id: 'seedling-b1', plotId: SEED_IDS.plotB, species: '白骨壤', source: '自育苗', spec: '45cm 裸根苗', quantity: 1900, arrivalDate: '2024-04-28' }),
-    seedlingRow({ id: 'seedling-b2', plotId: SEED_IDS.plotB, species: '秋茄', source: '外购', spec: '50cm 营养袋苗', quantity: 1600, arrivalDate: '2024-05-02' }),
-    seedlingRow({ id: 'seedling-c1', plotId: SEED_IDS.plotC, species: '无瓣海桑', source: '外购', spec: '60cm 营养袋苗', quantity: 4400, arrivalDate: '2024-03-12' }),
-    seedlingRow({ id: 'seedling-c2', plotId: SEED_IDS.plotC, species: '白骨壤', source: '自育苗', spec: '45cm 裸根苗', quantity: 3900, arrivalDate: '2024-03-16' }),
+    seedlingRow({ id: 'seedling-a1', plotId: SEED_IDS.plotA, species: '秋茄', source: '自育苗', spec: '50cm 裸根苗', quantity: 3200, guaranteeRate: null, arrivalDate: '2024-04-05' }),
+    seedlingRow({ id: 'seedling-a2', plotId: SEED_IDS.plotA, species: '桐花树', source: '外购', spec: '40cm 营养袋苗', quantity: 2400, guaranteeRate: 80, arrivalDate: '2024-04-10' }),
+    seedlingRow({ id: 'seedling-b1', plotId: SEED_IDS.plotB, species: '白骨壤', source: '自育苗', spec: '45cm 裸根苗', quantity: 1900, guaranteeRate: null, arrivalDate: '2024-04-28' }),
+    seedlingRow({ id: 'seedling-b2', plotId: SEED_IDS.plotB, species: '秋茄', source: '外购', spec: '50cm 营养袋苗', quantity: 1600, guaranteeRate: 80, arrivalDate: '2024-05-02' }),
+    // 进场 4000 株，现场累计领用 4200 株：整笔领用超出，挂起 200 株
+    seedlingRow({ id: 'seedling-c1', plotId: SEED_IDS.plotC, species: '无瓣海桑', source: '外购', spec: '60cm 营养袋苗', quantity: 4000, guaranteeRate: 80, arrivalDate: '2024-03-12' }),
+    seedlingRow({ id: 'seedling-c2', plotId: SEED_IDS.plotC, species: '白骨壤', source: '自育苗', spec: '45cm 裸根苗', quantity: 3900, guaranteeRate: null, arrivalDate: '2024-03-16' }),
   ];
 
   // ---------------- 栽植记录（每地块 2 条，引用真实苗木批次） ----------------
@@ -110,11 +134,11 @@ export async function seedDatabase(): Promise<void> {
     plantingRow({ id: 'planting-a2', plotId: SEED_IDS.plotA, seedlingId: 'seedling-a2', plantDate: '2024-04-15', spacingM: 0.8, count: 2200, operator: '东港二班' }),
     plantingRow({ id: 'planting-b1', plotId: SEED_IDS.plotB, seedlingId: 'seedling-b1', plantDate: '2024-05-06', spacingM: 1.2, count: 1800, operator: '西湾一班' }),
     plantingRow({ id: 'planting-b2', plotId: SEED_IDS.plotB, seedlingId: 'seedling-b2', plantDate: '2024-05-09', spacingM: 1, count: 1500, operator: '西湾二班' }),
-    plantingRow({ id: 'planting-c1', plotId: SEED_IDS.plotC, seedlingId: 'seedling-c1', plantDate: '2024-03-20', spacingM: 1.5, count: 4200, operator: '北屿一班' }),
+    plantingRow({ id: 'planting-c1', plotId: SEED_IDS.plotC, seedlingId: 'seedling-c1', plantDate: '2024-03-20', spacingM: 1.5, count: 4200, operator: '北屿一班', status: 'pending', overQuantity: 200 }),
     plantingRow({ id: 'planting-c2', plotId: SEED_IDS.plotC, seedlingId: 'seedling-c2', plantDate: '2024-03-24', spacingM: 1.2, count: 3800, operator: '北屿二班' }),
   ];
 
-  // 各地块栽植总株数，用于派生成活率
+  // 各地块栽植总株数，用于派生成活率（含挂起部分，整块地口径不变）
   const totalByPlot: Record<string, number> = {
     [SEED_IDS.plotA]: 5200,
     [SEED_IDS.plotB]: 3300,
@@ -139,11 +163,56 @@ export async function seedDatabase(): Promise<void> {
     replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
   ];
 
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
-    await db.plots.bulkPut(plots);
-    await db.seedlings.bulkPut(seedlings);
-    await db.plantings.bulkPut(plantings);
-    await db.surveys.bulkPut(surveys);
-    await db.replants.bulkPut(replants);
-  });
+  // ---------------- 批次结算单（待确认 + 已确认各一） ----------------
+  const settlements: Settlement[] = [
+    // 东港 a2（外购桐花树）第 3 测次：摊回成活 1738 / 2200 = 79.0%，低于 80%，差 1.0 个点 / 22 株
+    settlementRow({
+      id: 'settlement-a2-r3',
+      seedlingId: 'seedling-a2',
+      plotId: SEED_IDS.plotA,
+      surveyId: 'survey-a3',
+      round: 3,
+      surveyDate: '2025-03-15',
+      issuedCount: 2200,
+      aliveCount: 1738,
+      batchRate: 79.0,
+      guaranteeRate: 80,
+      shortRate: 1.0,
+      shortCount: 22,
+      status: '待确认',
+      confirmedAt: '',
+      remark: '',
+    }),
+    // 西湾 b2（外购秋茄）第 2 测次：摊回成活 960 / 1500 = 64.0%，低于 80%，差 16.0 个点 / 240 株，项目部已确认
+    settlementRow({
+      id: 'settlement-b2-r2',
+      seedlingId: 'seedling-b2',
+      plotId: SEED_IDS.plotB,
+      surveyId: 'survey-b2',
+      round: 2,
+      surveyDate: '2024-10-12',
+      issuedCount: 1500,
+      aliveCount: 960,
+      batchRate: 64.0,
+      guaranteeRate: 80,
+      shortRate: 16.0,
+      shortCount: 240,
+      status: '已确认',
+      confirmedAt: '2024-11-02',
+      remark: '同意按差额株数扣减结算',
+    }),
+  ];
+
+  await db.transaction(
+    'rw',
+    [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.settlements],
+    async () => {
+      await db.plots.bulkPut(plots);
+      await db.seedlings.bulkPut(seedlings);
+      await db.plantings.bulkPut(plantings);
+      await db.surveys.bulkPut(surveys);
+      await db.replants.bulkPut(replants);
+      await db.settlements.bulkPut(settlements);
+    },
+  );
 }

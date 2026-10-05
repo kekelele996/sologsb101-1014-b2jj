@@ -7,6 +7,7 @@ import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Badge, Button, Layout, Menu, Space, Tag, Typography } from 'antd';
 import {
   AppstoreOutlined,
+  AuditOutlined,
   BarChartOutlined,
   DashboardOutlined,
   ExperimentOutlined,
@@ -15,6 +16,7 @@ import {
 import { ROUTES } from './router';
 import { usePlotStore } from './stores/plotStore';
 import { useReplantStore } from './stores/replantStore';
+import { useSettlementStore } from './stores/settlementStore';
 import { useSurveyStore } from './stores/surveyStore';
 import { percentText } from './utils/rate';
 
@@ -24,6 +26,7 @@ const { Header, Sider, Content, Footer } = Layout;
 function selectedKey(pathname: string): string {
   if (pathname.startsWith('/plots/')) return ROUTES.plots;
   if (pathname.startsWith('/surveys')) return ROUTES.surveys;
+  if (pathname.startsWith('/settlements')) return ROUTES.settlements;
   if (pathname.startsWith('/replants')) return ROUTES.replants;
   return ROUTES.plots;
 }
@@ -39,12 +42,15 @@ export default function App() {
   const loadAll = usePlotStore((state) => state.loadAll);
   const initSurvey = useSurveyStore((state) => state.init);
   const initReplant = useReplantStore((state) => state.init);
+  const initSettlement = useSettlementStore((state) => state.init);
+  const retryCount = useSettlementStore((state) => state.retryItems.length);
 
   useEffect(() => {
     void loadAll();
     void initSurvey();
     void initReplant();
-  }, [loadAll, initSurvey, initReplant]);
+    void initSettlement();
+  }, [loadAll, initSurvey, initReplant, initSettlement]);
 
   const currentPlot = plots.find((plot) => plot.id === currentPlotId) ?? null;
   const currentStat = currentPlot === null ? null : statOf(currentPlot.id);
@@ -69,6 +75,7 @@ export default function App() {
           items={[
             { key: ROUTES.plots, icon: <AppstoreOutlined />, label: '修复地块台账' },
             { key: ROUTES.surveys, icon: <ExperimentOutlined />, label: '成活率验收台' },
+            { key: ROUTES.settlements, icon: <AuditOutlined />, label: '批次对账与结算' },
             { key: ROUTES.replants, icon: <ToolOutlined />, label: '补植计划' },
           ]}
         />
@@ -80,8 +87,14 @@ export default function App() {
             <BarChartOutlined /> 栽植 {counts.plantings ?? 0} · 验收 {counts.surveys ?? 0}
           </div>
           <div>
-            <ToolOutlined /> 补植 {counts.replants ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
+            <AuditOutlined /> 结算 {counts.settlements ?? 0} · 补植 {counts.replants ?? 0} · 结构 v
+            {String(counts.schemaVersion ?? '-')}
           </div>
+          {retryCount > 0 ? (
+            <div style={{ color: '#f5b041' }}>
+              <AuditOutlined /> 苗圃侧 {retryCount} 笔保存待本侧重试
+            </div>
+          ) : null}
         </div>
       </Sider>
 
@@ -109,6 +122,9 @@ export default function App() {
                 <Tag>{currentPlot.areaMu} 亩</Tag>
                 <Tag>{currentPlot.tideZone}潮位带 / {currentPlot.substrate}</Tag>
                 <Tag color="blue">栽植 {currentStat.plantTotal.toLocaleString('zh-CN')} 株</Tag>
+                {currentStat.pendingCount > 0 ? (
+                  <Tag color="orange">挂起 {currentStat.pendingCount.toLocaleString('zh-CN')} 株</Tag>
+                ) : null}
                 <Tag color={currentStat.surveyCount === 0 ? 'default' : 'green'}>
                   {currentStat.surveyCount === 0 ? '尚未验收' : `成活率 ${percentText(currentStat.latestRate)}`}
                 </Tag>

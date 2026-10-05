@@ -1,6 +1,7 @@
 /**
- * /plots/:id/plantings 栽植记录
- * 录入株距与株数并即时提示栽植密度是否异常。
+ * /plots/:id/plantings 栽植领用记录（项目部侧）
+ * 项目部只登记栽植领用：挑苗圃当时在库的批次，录株距与株数并即时提示栽植密度。
+ * 累计领用超出批次进场数量的整笔先「挂起」（不参与测次成活株数摊回），等苗圃补足进场数量后自动恢复在库。
  * 消费模型：Planting、Seedling；复用组件：<FilterBar>、<StatBadge>、<EmptyPanel>
  */
 import { useMemo, useState } from 'react';
@@ -19,6 +20,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -28,11 +30,10 @@ import { useNavigate, useParams } from 'react-router-dom';
 import EmptyPanel from '../components/common/EmptyPanel';
 import FilterBar from '../components/common/FilterBar';
 import StatBadge from '../components/common/StatBadge';
-import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
-import { db } from '../utils/db';
+import { removePlanting, savePlanting } from '../utils/db';
 import type { Planting } from '../types/planting';
-import type { Seedling } from '../types/seedling';
+import { guaranteeRateText } from '../types/seedling';
 import { ROUTES } from '../router';
 import {
   DENSITY_MAX_M2_PER_PLANT,
@@ -64,9 +65,25 @@ export default function PlantingEntry() {
   const { message } = App.useApp();
   const ready = usePlotStore((state) => state.ready);
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
+  const allSeedlings = usePlotStore((state) => state.seedlings);
+  const allPlantings = usePlotStore((state) => state.plantings);
+  const reconcile = usePlotStore((state) => state.reconcile);
+  const refreshCounts = usePlotStore((state) => state.refreshCounts);
 
-  const seedlingTable = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
-  const { rows, loading, create, update, remove } = useIdbTable<Planting>(db.plantings, { sortByUpdatedAt: false });
+  const plotSeedlings = useMemo(
+    () =>
+      allSeedlings
+        .filter((row) => row.plotId === id)
+        .sort((a, b) => b.arrivalDate.localeCompare(a.arrivalDate)),
+    [allSeedlings, id],
+  );
+  const plotPlantings = useMemo(
+    () =>
+      allPlantings
+        .filter((row) => row.plotId === id)
+        .sort((a, b) => b.plantDate.localeCompare(a.plantDate)),
+    [allPlantings, id],
+  );
 
   const [keyword, setKeyword] = useState('');
   const [operatorFilter, setOperatorFilter] = useState('all');
@@ -75,16 +92,6 @@ export default function PlantingEntry() {
   const [submitting, setSubmitting] = useState(false);
   const [density, setDensity] = useState<DensityCheck | null>(null);
   const [form] = Form.useForm<PlantingFormValues>();
-
-  const plotSeedlings = useMemo(
-    () => seedlingTable.rows.filter((row) => row.plotId === id),
-    [seedlingTable.rows, id],
-  );
-
-  const plotPlantings = useMemo(
-    () => rows.filter((row) => row.plotId === id).sort((a, b) => b.plantDate.localeCompare(a.plantDate)),
-    [rows, id],
-  );
 
   const operatorOptions = useMemo(
     () => Array.from(new Set(plotPlantings.map((row) => row.operator).filter((item) => item !== ''))),
@@ -106,6 +113,10 @@ export default function PlantingEntry() {
   }, [plotPlantings, plotSeedlings, keyword, operatorFilter]);
 
   const totalCount = plotPlantings.reduce((acc, row) => acc + row.count, 0);
+  const activeCount = plotPlantings
+    .filter((row) => row.status === 'active')
+    .reduce((acc, row) => acc + row.count, 0);
+  const pendingCount = totalCount - activeCount;
   const avgSpacing =
     plotPlantings.length === 0
       ? 0
@@ -113,16 +124,22 @@ export default function PlantingEntry() {
   const usedSeedlingIds = new Set(plotPlantings.map((row) => row.seedlingId));
 
   const seedlingLabel = (seedlingId: string): string => {
-    const seedling = seedlingTable.rows.find((row) => row.id === seedlingId);
+    const seedling = plotSeedlings.find((row) => row.id === seedlingId);
     return seedling === undefined ? '（批次已删除）' : `${seedling.species} · ${seedling.spec}`;
   };
+
+  /** 新建领用时只允许挑苗圃当时「还有在库余量」的批次 */
+  const selectableSeedlings = useMemo(
+    () => plotSeedlings.filter((row) => (reconcile[row.id]?.available ?? row.quantity) > 0),
+    [plotSeedlings, reconcile],
+  );
 
   const openCreate = (): void => {
     setEditing(null);
     setDensity(null);
     form.setFieldsValue({
       ...DEFAULT_VALUES,
-      seedlingId: plotSeedlings.length > 0 ? plotSeedlings[0].id : '',
+      seedlingId: selectableSeedlings.length > 0 ? selectableSeedlings[0].id : '',
       plantDate: dayjs(),
     });
     setOpen(true);
@@ -152,22 +169,28 @@ export default function PlantingEntry() {
     try {
       const values = await form.validateFields();
       setSubmitting(true);
-      const payload = {
-        plotId: id,
-        seedlingId: values.seedlingId,
-        plantDate: values.plantDate.format('YYYY-MM-DD'),
-        spacingM: values.spacingM,
-        count: values.count,
-        operator: values.operator.trim(),
-      };
-      if (editing === null) {
-        await create(payload, 'planting');
-        message.success(`已登记栽植 ${payload.count} 株`);
+      const seedling = plotSeedlings.find((row) => row.id === values.seedlingId);
+      const row = await savePlanting({
+        id: editing?.id,
+        draft: {
+          plotId: id,
+          seedlingId: values.seedlingId,
+          plantDate: values.plantDate.format('YYYY-MM-DD'),
+          spacingM: values.spacingM,
+          count: values.count,
+          operator: values.operator.trim(),
+        },
+      });
+      await refreshCounts();
+      if (row.status === 'pending') {
+        message.warning(
+          `该批次进场仅 ${seedling?.quantity ?? 0} 株，本笔 ${row.count} 株超出余量，已先挂起 ${row.overQuantity} 株；补足进场数量后自动恢复在库。`,
+          8,
+        );
       } else {
-        await update(editing.id, payload);
-        message.success('栽植记录已更新');
+        message.success(editing === null ? `已登记栽植 ${row.count} 株` : '栽植记录已更新');
       }
-      const check = plot === undefined ? null : checkDensity(plot.areaMu, payload.spacingM, payload.count);
+      const check = plot === undefined ? null : checkDensity(plot.areaMu, row.spacingM, row.count);
       if (check !== null && !check.ok) {
         message.warning(check.message, 6);
       }
@@ -180,7 +203,7 @@ export default function PlantingEntry() {
   };
 
   if (!ready) {
-    return <Card loading title="栽植记录" />;
+    return <Card loading title="栽植领用记录" />;
   }
 
   if (plot === undefined) {
@@ -204,27 +227,42 @@ export default function PlantingEntry() {
       title: '栽植日期',
       dataIndex: 'plantDate',
       key: 'plantDate',
-      width: 130,
+      width: 110,
       sorter: (a, b) => a.plantDate.localeCompare(b.plantDate),
     },
     {
       title: '苗木批次',
       key: 'seedling',
-      width: 200,
+      width: 190,
       render: (_value, record) => (
         <Space direction="vertical" size={0}>
           <span>{seedlingLabel(record.seedlingId)}</span>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            {plotSeedlings.find((item) => item.id === record.seedlingId)?.source ?? '—'}
+            {plotSeedlings.find((item) => item.id === record.seedlingId)?.source ?? '—'} · 进场{' '}
+            {plotSeedlings.find((item) => item.id === record.seedlingId)?.quantity ?? 0} 株
           </Typography.Text>
         </Space>
       ),
     },
     {
+      title: '领用状态',
+      dataIndex: 'status',
+      key: 'status',
+      width: 110,
+      render: (value: Planting['status'], record) =>
+        value === 'pending' ? (
+          <Tooltip title={`超出进场数量 ${record.overQuantity} 株，先挂起，不参与测次摊回`}>
+            <Tag color="orange">挂起 {record.overQuantity} 株</Tag>
+          </Tooltip>
+        ) : (
+          <Tag color="green">在库</Tag>
+        ),
+    },
+    {
       title: '株距（米）',
       dataIndex: 'spacingM',
       key: 'spacingM',
-      width: 110,
+      width: 90,
       align: 'right',
       render: (value: number) => value.toFixed(2),
     },
@@ -232,7 +270,7 @@ export default function PlantingEntry() {
       title: '株数',
       dataIndex: 'count',
       key: 'count',
-      width: 110,
+      width: 90,
       align: 'right',
       sorter: (a, b) => a.count - b.count,
       render: (value: number) => value.toLocaleString('zh-CN'),
@@ -240,14 +278,14 @@ export default function PlantingEntry() {
     {
       title: '平均单株占地',
       key: 'perPlant',
-      width: 140,
+      width: 130,
       align: 'right',
       render: (_value, record) => `${checkDensity(plot.areaMu, record.spacingM, record.count).areaPerPlant} ㎡/株`,
     },
     {
       title: '密度校验',
       key: 'densityCheck',
-      width: 130,
+      width: 100,
       render: (_value, record) => {
         const check = checkDensity(plot.areaMu, record.spacingM, record.count);
         return (
@@ -257,11 +295,12 @@ export default function PlantingEntry() {
         );
       },
     },
-    { title: '班组', dataIndex: 'operator', key: 'operator', width: 120 },
+    { title: '班组', dataIndex: 'operator', key: 'operator', width: 100 },
     {
       title: '操作',
       key: 'action',
-      width: 150,
+      width: 140,
+      fixed: 'right',
       render: (_value, record) => (
         <Space size={4}>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
@@ -273,7 +312,8 @@ export default function PlantingEntry() {
             okButtonProps={{ danger: true }}
             cancelText="取消"
             onConfirm={async () => {
-              await remove(record.id);
+              await removePlanting(record.id);
+              await refreshCounts();
               message.success('栽植记录已删除');
             }}
           >
@@ -293,7 +333,7 @@ export default function PlantingEntry() {
           返回地块台账
         </Button>
         <Typography.Text strong style={{ fontSize: 16 }}>
-          {plot.name} · 栽植记录
+          {plot.name} · 栽植领用记录
         </Typography.Text>
         <Tag color="cyan">{plot.tideZone}潮位带</Tag>
         <Tag>
@@ -301,15 +341,37 @@ export default function PlantingEntry() {
         </Tag>
       </Space>
 
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 14 }}
+        message="项目部侧台账：只管栽植领用与验收测次"
+        description="领用时只能挑苗圃当时在库、有余量的批次；按栽植日期累计超出进场数量的领用先挂起，不参与测次成活株数摊回，等苗圃补足进场数量后自动恢复在库。"
+      />
+
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="栽植记录" value={plotPlantings.length} suffix="条" tone="primary" />
         <StatBadge label="栽植总株数" value={totalCount.toLocaleString('zh-CN')} suffix="株" tone="info" />
+        <StatBadge
+          label="在库领用"
+          value={activeCount.toLocaleString('zh-CN')}
+          suffix="株"
+          tone="success"
+          hint="参与整块地成活率与批次摊回"
+        />
+        <StatBadge
+          label="挂起领用"
+          value={pendingCount.toLocaleString('zh-CN')}
+          suffix="株"
+          tone={pendingCount > 0 ? 'danger' : 'default'}
+        />
         <StatBadge label="平均株距" value={avgSpacing.toFixed(2)} suffix="米" tone="default" />
         <StatBadge
           label="已引用批次"
           value={`${usedSeedlingIds.size} / ${plotSeedlings.length}`}
           percent={plotSeedlings.length > 0 ? (usedSeedlingIds.size / plotSeedlings.length) * 100 : 0}
-          tone="success"
+          tone="default"
+          size="small"
           hint="已被栽植记录引用的苗木批次占全部批次的比例"
         />
       </div>
@@ -320,7 +382,7 @@ export default function PlantingEntry() {
           showIcon
           style={{ marginBottom: 14 }}
           message="该地块尚未登记苗木批次"
-          description="栽植记录必须引用一个苗木批次，请先到苗木批次页登记进场苗木。"
+          description="栽植记录必须引用一个苗木批次，请先到苗木批次页由苗圃登记进场苗木。"
           action={
             <Button size="small" onClick={() => navigate(ROUTES.seedlings(plot.id))}>
               去登记苗木批次
@@ -330,7 +392,7 @@ export default function PlantingEntry() {
       ) : null}
 
       <Card
-        title="栽植记录"
+        title="栽植领用记录"
         extra={
           <Button type="primary" icon={<PlusOutlined />} onClick={openCreate} disabled={plotSeedlings.length === 0}>
             新增栽植记录
@@ -352,10 +414,10 @@ export default function PlantingEntry() {
           resultText={`命中 ${filtered.length} / ${plotPlantings.length} 条`}
         />
 
-        {plotPlantings.length === 0 && !loading ? (
+        {plotPlantings.length === 0 ? (
           <EmptyPanel
             title="该地块还没有栽植记录"
-            description="录入栽植日期、株距与株数，系统会按地块面积自动校验栽植密度是否合理。"
+            description="从苗圃在库批次里挑选苗木，录入栽植日期、株距与株数，系统会按地块面积自动校验栽植密度是否合理。"
             actionText="新增栽植记录"
             onAction={openCreate}
           />
@@ -363,9 +425,9 @@ export default function PlantingEntry() {
           <Table<Planting>
             rowKey="id"
             size="middle"
-            loading={loading}
             columns={columns}
             dataSource={filtered}
+            scroll={{ x: 1280 }}
             pagination={{ pageSize: 8, showSizeChanger: false }}
             locale={{
               emptyText: (
@@ -384,7 +446,7 @@ export default function PlantingEntry() {
       </Card>
 
       <Modal
-        title={editing === null ? '新增栽植记录' : '编辑栽植记录'}
+        title={editing === null ? '新增栽植领用记录' : '编辑栽植记录'}
         open={open}
         onCancel={() => setOpen(false)}
         onOk={() => void handleSubmit()}
@@ -394,13 +456,22 @@ export default function PlantingEntry() {
         width={560}
       >
         <Form form={form} layout="vertical" initialValues={DEFAULT_VALUES} onValuesChange={handleValuesChange}>
-          <Form.Item name="seedlingId" label="苗木批次" rules={[{ required: true, message: '请选择苗木批次' }]}>
+          <Form.Item name="seedlingId" label="苗木批次（只列苗圃当时在库、有余量的批次）" rules={[{ required: true, message: '请选择苗木批次' }]}>
             <Select
-              placeholder="选择该地块下的苗木批次"
-              options={plotSeedlings.map((row) => ({
-                value: row.id,
-                label: `${row.species} · ${row.spec} · ${row.quantity} 株（${row.source}）`,
-              }))}
+              placeholder="选择该地块下在库的苗木批次"
+              options={plotSeedlings.map((row) => {
+                const item = reconcile[row.id];
+                const available = item?.available ?? row.quantity;
+                const inStock = available > 0;
+                return {
+                  value: row.id,
+                  disabled: editing === null && !inStock,
+                  label: `${row.species} · ${row.spec} · 进场 ${row.quantity} 株 · 在库余量 ${Math.max(
+                    0,
+                    available,
+                  )} 株（${row.source} / ${guaranteeRateText(row.guaranteeRate)}）${inStock ? '' : ' · 已无在库余量'}`,
+                };
+              })}
             />
           </Form.Item>
           <Space size={12} style={{ display: 'flex' }}>
@@ -432,13 +503,16 @@ export default function PlantingEntry() {
                 <span>
                   {density.message}
                   <br />
+                  本笔若按栽植日期累计后超出批次进场数量，会整笔先挂起，不参与测次成活株数摊回。
+                  <br />
                   合理区间为 {DENSITY_MIN_M2_PER_PLANT}–{DENSITY_MAX_M2_PER_PLANT} ㎡/株。
                 </span>
               }
             />
           ) : (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              填写株距与株数后会自动校验密度（合理区间 {DENSITY_MIN_M2_PER_PLANT}–{DENSITY_MAX_M2_PER_PLANT} ㎡/株）。
+              填写株距与株数后会自动校验密度（合理区间 {DENSITY_MIN_M2_PER_PLANT}–{DENSITY_MAX_M2_PER_PLANT}{' '}
+              ㎡/株）；超出在库余量的领用先挂起。
             </Typography.Text>
           )}
         </Form>

@@ -5,7 +5,7 @@
  */
 import { create } from 'zustand';
 import type { RateLevel, Survey } from '../types/survey';
-import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
+import { db, initDatabase, patchSurveyGrades, removeSurvey, saveSurvey, ROW_REVISION } from '../utils/db';
 import type { SurvivalSummary } from '../hooks/useSurvivalRate';
 import { nowIso, uuid } from '../utils/id';
 import { calcSurvivalRate, rateLevel } from '../utils/rate';
@@ -99,9 +99,9 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       gradeManual: false,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
-    await putSurvey(row);
+    await saveSurvey(row);
     set({ revision: get().revision + 1 });
     return row;
   },
@@ -111,7 +111,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     if (!existing) return;
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
-    await putSurvey({
+    await saveSurvey({
       ...existing,
       plotId: draft.plotId,
       round: draft.round,
@@ -154,7 +154,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       state: '待补植',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     });
     set({ revision: get().revision + 1, lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` });
     return `已生成补植计划：缺株 ${missing} 株`;

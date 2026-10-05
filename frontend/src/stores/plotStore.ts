@@ -2,6 +2,9 @@
  * 地块状态管理（Zustand）
  * 维护地块列表、当前选中地块、筛选条件与地块级派生统计；
  * 所有写操作同步落 IndexedDB，写完后由 liveQuery 自动回灌。
+ *
+ * 两侧分账后这里同时订阅苗圃侧（seedlings / settlements）与
+ * 项目部侧（plantings / surveys）数据，用 buildReconcile 产出按批次对账表。
  */
 import { create } from 'zustand';
 import { liveQuery } from 'dexie';
@@ -9,6 +12,7 @@ import type { Plot, PlotDraft, Substrate, TideZone } from '../types/plot';
 import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey, RateLevel } from '../types/survey';
+import type { Settlement } from '../types/settlement';
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
@@ -19,6 +23,7 @@ import {
   removePlot,
 } from '../utils/db';
 import { buildSurvivalSummary, type SurvivalSummary } from '../hooks/useSurvivalRate';
+import { buildReconcile, type BatchReconcile } from '../utils/settlement';
 import { nowIso, uuid } from '../utils/id';
 
 /** 地块筛选条件（关键字 + 潮位带 + 底质），由 <FilterBar> 同步到 URL query */
@@ -37,6 +42,8 @@ export interface PlotStat {
   seedlingQuantity: number;
   /** 栽植总株数（株） */
   plantTotal: number;
+  /** 挂起领用株数（超出进场数量，未参与摊回） */
+  pendingCount: number;
   /** 验收测次数 */
   surveyCount: number;
   /** 最新成活率（%） */
@@ -74,6 +81,9 @@ interface PlotStoreState {
   seedlings: Seedling[];
   plantings: Planting[];
   surveys: Survey[];
+  settlements: Settlement[];
+  /** 按批次对账表（在库数量 + 最新测次摊回的批次成活率） */
+  reconcile: Record<string, BatchReconcile>;
   currentPlotId: string | null;
   loading: boolean;
   ready: boolean;
@@ -100,6 +110,7 @@ const EMPTY_STAT: Omit<PlotStat, 'plotId'> = {
   seedlingCount: 0,
   seedlingQuantity: 0,
   plantTotal: 0,
+  pendingCount: 0,
   surveyCount: 0,
   latestRate: 0,
   level: 'poor',
@@ -114,6 +125,8 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   seedlings: [],
   plantings: [],
   surveys: [],
+  settlements: [],
+  reconcile: {},
   currentPlotId: readCurrentPlotId(),
   loading: true,
   ready: false,
@@ -130,26 +143,32 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [plots, seedlings, plantings, surveys] = await Promise.all([
+          const [plots, seedlings, plantings, surveys, settlements] = await Promise.all([
             db.plots.toArray(),
             db.seedlings.toArray(),
             db.plantings.toArray(),
             db.surveys.toArray(),
+            db.settlements.toArray(),
           ]);
-          return { plots, seedlings, plantings, surveys };
+          return { plots, seedlings, plantings, surveys, settlements };
         }).subscribe({
-          next: ({ plots, seedlings, plantings, surveys }) => {
+          next: ({ plots, seedlings, plantings, surveys, settlements }) => {
             const stats: Record<string, PlotStat> = {};
             const summaries: Record<string, SurvivalSummary> = {};
+            const reconcile = buildReconcile(seedlings, plantings, surveys);
             plots.forEach((plot) => {
               const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
               const summary = buildSurvivalSummary(plot.id, surveys, plantings);
+              const pendingCount = plantings
+                .filter((row) => row.plotId === plot.id && row.status === 'pending')
+                .reduce((acc, row) => acc + row.count, 0);
               summaries[plot.id] = summary;
               stats[plot.id] = {
                 plotId: plot.id,
                 seedlingCount: plotSeedlings.length,
                 seedlingQuantity: plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
                 plantTotal: summary.totalCount,
+                pendingCount,
                 surveyCount: summary.points.length,
                 latestRate: summary.latestRate,
                 level: summary.level,
@@ -165,6 +184,8 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
               seedlings,
               plantings,
               surveys,
+              settlements,
+              reconcile,
               stats,
               summaries,
               loading: false,
