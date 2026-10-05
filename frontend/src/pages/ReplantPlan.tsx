@@ -118,11 +118,13 @@ export default function ReplantPlan() {
     setEditing(null);
     const plotId = filters.plotId !== 'all' ? filters.plotId : plots.length > 0 ? plots[0].id : '';
     const stat = statOf(plotId);
+    const plotBatchId = plantings.find((row) => row.plotId === plotId)?.seedlingId;
+    const plotSpecies = plotBatchId ? (seedlings.find((row) => row.id === plotBatchId)?.species ?? '秋茄') : '秋茄';
     form.setFieldsValue({
       plotId,
       missingCount: stat.suggestReplant > 0 ? stat.suggestReplant : 100,
       planDate: dayjs().add(15, 'day'),
-      species: seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄',
+      species: plotSpecies,
       state: '待补植',
     });
     setOpen(true);

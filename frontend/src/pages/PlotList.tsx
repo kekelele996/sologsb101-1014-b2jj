@@ -113,7 +113,7 @@ export default function PlotList() {
       setSubmitting(true);
       if (editing === null) {
         const row = await createPlot(values);
-        message.success(`已新建地块「${row.name}」，可继续登记苗木批次`);
+        message.success(`已新建地块「${row.name}」，可到苗圃供苗台挑苗后登记栽植领用`);
       } else {
         await updatePlot(editing.id, values);
         message.success('地块信息已更新');
@@ -146,7 +146,7 @@ export default function PlotList() {
           <Typography.Link
             onClick={() => {
               selectPlot(record.id);
-              navigate(ROUTES.seedlings(record.id));
+              navigate(ROUTES.plantings(record.id));
             }}
           >
             {record.name}
@@ -186,19 +186,27 @@ export default function PlotList() {
       render: (value: string) => <Tag color={value === '已验收' ? 'green' : 'blue'}>{value}</Tag>,
     },
     {
-      title: '苗木批次',
+      title: '领用批次',
       key: 'seedlingCount',
       width: 96,
       align: 'right',
       render: (_value, record) => `${statOf(record.id).seedlingCount} 批`,
     },
     {
-      title: '栽植总株数',
+      title: '已落实栽植',
       key: 'plantTotal',
       width: 112,
       align: 'right',
       sorter: (a, b) => statOf(a.id).plantTotal - statOf(b.id).plantTotal,
-      render: (_value, record) => `${statOf(record.id).plantTotal.toLocaleString('zh-CN')} 株`,
+      render: (_value, record) => {
+        const stat = statOf(record.id);
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{stat.plantTotal.toLocaleString('zh-CN')} 株</span>
+            {stat.heldTotal > 0 ? <Tag color="orange">挂起 {stat.heldTotal}</Tag> : null}
+          </Space>
+        );
+      },
     },
     {
       title: '验收测次',
@@ -247,27 +255,20 @@ export default function PlotList() {
             type="link"
             onClick={() => {
               selectPlot(record.id);
-              navigate(ROUTES.seedlings(record.id));
-            }}
-          >
-            苗木批次
-          </Button>
-          <Button
-            size="small"
-            type="link"
-            onClick={() => {
-              selectPlot(record.id);
               navigate(ROUTES.plantings(record.id));
             }}
           >
-            栽植记录
+            栽植领用
+          </Button>
+          <Button size="small" type="link" onClick={() => navigate(ROUTES.nursery)}>
+            苗圃批次
           </Button>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
           </Button>
           <Popconfirm
             title="确认删除该地块？"
-            description="该地块下的苗木批次、栽植记录、验收记录与补植计划会一并删除，且不可恢复。"
+            description="项目部侧的领用、验收与补植随地块删除；苗圃侧流水账与结算单由本侧重算清理。"
             okText="删除"
             okButtonProps={{ danger: true }}
             cancelText="取消"
@@ -287,7 +288,7 @@ export default function PlotList() {
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 14 }}>
         <StatBadge label="地块总数" value={plots.length} suffix="块" tone="primary" icon={<EnvironmentOutlined />} />
         <StatBadge
-          label="栽植总株数"
+          label="已落实栽植总数"
           value={totals.plantTotal.toLocaleString('zh-CN')}
           suffix="株"
           tone="info"

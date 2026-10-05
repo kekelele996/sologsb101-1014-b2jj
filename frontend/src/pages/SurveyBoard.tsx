@@ -491,7 +491,8 @@ export default function SurveyBoard() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            成活率 = 成活株数 / 该地块栽植总株数，保存时自动计算；成活率低于 {SURVIVAL_WARN_RATE}% 会给出告警提示。
+            成活率 = 成活株数 / 该地块已落实栽植总株数（挂起不计），保存时自动计算；低于 {SURVIVAL_WARN_RATE}% 会告警，
+            并由苗圃侧按领用把成活株数摊回批次、重算保证率差额结算单。
           </Typography.Text>
         </Form>
       </Modal>

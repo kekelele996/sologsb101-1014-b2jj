@@ -10,18 +10,23 @@ import {
   BarChartOutlined,
   DashboardOutlined,
   ExperimentOutlined,
+  FileProtectOutlined,
   ToolOutlined,
+  ShopOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from './router';
 import { usePlotStore } from './stores/plotStore';
 import { useReplantStore } from './stores/replantStore';
 import { useSurveyStore } from './stores/surveyStore';
+import { useNurseryStore } from './stores/nurseryStore';
 import { percentText } from './utils/rate';
 
 const { Header, Sider, Content, Footer } = Layout;
 
 /** 按当前路径推导高亮的导航项 */
 function selectedKey(pathname: string): string {
+  if (pathname.startsWith('/nursery')) return ROUTES.nursery;
+  if (pathname.startsWith('/settlements')) return ROUTES.settlements;
   if (pathname.startsWith('/plots/')) return ROUTES.plots;
   if (pathname.startsWith('/surveys')) return ROUTES.surveys;
   if (pathname.startsWith('/replants')) return ROUTES.replants;
@@ -39,12 +44,14 @@ export default function App() {
   const loadAll = usePlotStore((state) => state.loadAll);
   const initSurvey = useSurveyStore((state) => state.init);
   const initReplant = useReplantStore((state) => state.init);
+  const refreshFailing = useNurseryStore((state) => state.refreshFailing);
 
   useEffect(() => {
     void loadAll();
     void initSurvey();
     void initReplant();
-  }, [loadAll, initSurvey, initReplant]);
+    refreshFailing();
+  }, [loadAll, initSurvey, initReplant, refreshFailing]);
 
   const currentPlot = plots.find((plot) => plot.id === currentPlotId) ?? null;
   const currentStat = currentPlot === null ? null : statOf(currentPlot.id);
@@ -67,6 +74,8 @@ export default function App() {
           style={{ background: 'transparent' }}
           onClick={({ key }) => navigate(key)}
           items={[
+            { key: ROUTES.nursery, icon: <ShopOutlined />, label: '苗圃供苗台' },
+            { key: ROUTES.settlements, icon: <FileProtectOutlined />, label: '批次结算对账' },
             { key: ROUTES.plots, icon: <AppstoreOutlined />, label: '修复地块台账' },
             { key: ROUTES.surveys, icon: <ExperimentOutlined />, label: '成活率验收台' },
             { key: ROUTES.replants, icon: <ToolOutlined />, label: '补植计划' },
@@ -74,13 +83,16 @@ export default function App() {
         />
         <div style={{ padding: '12px 16px', color: 'rgba(217,242,230,0.62)', fontSize: 12, lineHeight: 1.9 }}>
           <div>
-            <DashboardOutlined /> 地块 {counts.plots ?? 0} · 批次 {counts.seedlings ?? 0}
+            <ShopOutlined /> 苗圃批次 {counts.seedlings ?? 0} · 结算 {counts.settlements ?? 0}
           </div>
           <div>
-            <BarChartOutlined /> 栽植 {counts.plantings ?? 0} · 验收 {counts.surveys ?? 0}
+            <DashboardOutlined /> 地块 {counts.plots ?? 0} · 领用 {counts.plantings ?? 0}
           </div>
           <div>
-            <ToolOutlined /> 补植 {counts.replants ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
+            <BarChartOutlined /> 验收 {counts.surveys ?? 0} · 补植 {counts.replants ?? 0}
+          </div>
+          <div style={{ color: (counts.outboxRetry ?? 0) > 0 ? '#ffb3a7' : 'rgba(217,242,230,0.62)' }}>
+            <ToolOutlined /> 苗圃侧重试 {counts.outboxRetry ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
           </div>
         </div>
       </Sider>
@@ -119,15 +131,13 @@ export default function App() {
             )}
           </Space>
           <Space>
+            <Button size="small" onClick={() => navigate(ROUTES.nursery)}>
+              苗圃供苗台
+            </Button>
             {currentPlot !== null ? (
-              <>
-                <Button size="small" onClick={() => navigate(ROUTES.seedlings(currentPlot.id))}>
-                  苗木批次
-                </Button>
-                <Button size="small" onClick={() => navigate(ROUTES.plantings(currentPlot.id))}>
-                  栽植记录
-                </Button>
-              </>
+              <Button size="small" onClick={() => navigate(ROUTES.plantings(currentPlot.id))}>
+                栽植领用
+              </Button>
             ) : null}
             <Badge count={counts.surveys ?? 0} showZero color="#0f766e" title="验收记录总数" />
           </Space>

@@ -14,6 +14,7 @@ import {
   putReplant,
   removeReplant,
   resetDatabase,
+  ROW_REVISION,
   type DatabaseSnapshot,
 } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
@@ -114,7 +115,7 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
       state: draft.state,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putReplant(row);
     set({ revision: get().revision + 1 });

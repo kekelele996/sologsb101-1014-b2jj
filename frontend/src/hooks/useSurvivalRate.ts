@@ -1,6 +1,7 @@
 /**
  * 成活率派生 hook
  * 按地块与测次算成活率、株高增幅与补植建议；被验收台与补植计划页复用。
+ * 分母口径：该地块「已落实」领用株数（挂起部分尚未栽植，不计入栽植总株数）。
  */
 import { useEffect, useMemo, useState } from 'react';
 import { liveQuery } from 'dexie';
@@ -66,7 +67,7 @@ export function buildSurvivalSummary(
 ): SurvivalSummary {
   const totalCount = plantings
     .filter((row) => row.plotId === plotId)
-    .reduce((acc, row) => acc + row.count, 0);
+    .reduce((acc, row) => acc + row.fulfilledCount, 0);
 
   const points: SurvivalPoint[] = surveys
     .filter((row) => row.plotId === plotId)

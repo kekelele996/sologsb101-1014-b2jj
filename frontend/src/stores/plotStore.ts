@@ -16,9 +16,10 @@ import {
   db,
   initDatabase,
   putPlot,
-  removePlot,
+  removeProjectPlot,
 } from '../utils/db';
 import { buildSurvivalSummary, type SurvivalSummary } from '../hooks/useSurvivalRate';
+import { afterPlotRemoved } from '../utils/sides';
 import { nowIso, uuid } from '../utils/id';
 
 /** 地块筛选条件（关键字 + 潮位带 + 底质），由 <FilterBar> 同步到 URL query */
@@ -31,12 +32,14 @@ export interface PlotFilters {
 /** 单个地块的派生统计，供地块台账与补植计划页复用 */
 export interface PlotStat {
   plotId: string;
-  /** 苗木批次数 */
+  /** 领用地块上出现过的苗木批次数（去重） */
   seedlingCount: number;
-  /** 进场苗木合计（株） */
+  /** 该地块已落实领用的进场苗木株数（株） */
   seedlingQuantity: number;
-  /** 栽植总株数（株） */
+  /** 已落实栽植总株数（株，挂起不计） */
   plantTotal: number;
+  /** 挂起待苗株数（株） */
+  heldTotal: number;
   /** 验收测次数 */
   surveyCount: number;
   /** 最新成活率（%） */
@@ -100,6 +103,7 @@ const EMPTY_STAT: Omit<PlotStat, 'plotId'> = {
   seedlingCount: 0,
   seedlingQuantity: 0,
   plantTotal: 0,
+  heldTotal: 0,
   surveyCount: 0,
   latestRate: 0,
   level: 'poor',
@@ -142,14 +146,22 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
             const stats: Record<string, PlotStat> = {};
             const summaries: Record<string, SurvivalSummary> = {};
             plots.forEach((plot) => {
-              const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
+              // 地块上的批次由「已领用批次」推导；批次本身是苗圃全局资源
+              const plotPlantings = plantings.filter((row) => row.plotId === plot.id);
+              const plotSeedlingIds = new Set(plotPlantings.map((row) => row.seedlingId));
+              const plotSeeded = plotPlantings.reduce((acc, row) => acc + row.fulfilledCount, 0);
+              const plotHeld = plotPlantings.reduce(
+                (acc, row) => acc + Math.max(0, row.count - row.fulfilledCount),
+                0,
+              );
               const summary = buildSurvivalSummary(plot.id, surveys, plantings);
               summaries[plot.id] = summary;
               stats[plot.id] = {
                 plotId: plot.id,
-                seedlingCount: plotSeedlings.length,
-                seedlingQuantity: plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
+                seedlingCount: plotSeedlingIds.size,
+                seedlingQuantity: plotSeeded,
                 plantTotal: summary.totalCount,
+                heldTotal: plotHeld,
                 surveyCount: summary.points.length,
                 latestRate: summary.latestRate,
                 level: summary.level,
@@ -229,7 +241,10 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   },
 
   async deletePlot(plotId) {
-    await removePlot(plotId);
+    // 项目部侧先删自己这摊（领用 / 验收 / 补植随地块清理）
+    await removeProjectPlot(plotId);
+    // 苗圃侧各记各的：流水账与结算单清理失败只重试苗圃侧，地块删除不回滚
+    await afterPlotRemoved(plotId);
     if (get().currentPlotId === plotId) {
       get().selectPlot(null);
     }

@@ -4,12 +4,12 @@
  * 成活率派生值统一由 hooks/useSurvivalRate 的纯函数产出，避免口径分散。
  */
 import { create } from 'zustand';
-import type { RateLevel, Survey } from '../types/survey';
-import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
+import type { RateLevel, Survey, SurveyDraft } from '../types/survey';
+import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey, ROW_REVISION } from '../utils/db';
 import type { SurvivalSummary } from '../hooks/useSurvivalRate';
 import { nowIso, uuid } from '../utils/id';
 import { calcSurvivalRate, rateLevel } from '../utils/rate';
-import type { SurveyDraft } from '../types/survey';
+import { afterSurveySaved } from '../utils/sides';
 import { usePlotStore } from './plotStore';
 
 /** 验收筛选条件（地块 + 等级 + 关键字 + 日期区间） */
@@ -49,10 +49,11 @@ interface SurveyStoreState {
 }
 
 function totalPlantedOf(plotId: string): number {
+  // 栽植总株数只算已落实领用（挂起部分尚未在地块上栽植）
   return usePlotStore
     .getState()
     .plantings.filter((row) => row.plotId === plotId)
-    .reduce((acc, row) => acc + row.count, 0);
+    .reduce((acc, row) => acc + row.fulfilledCount, 0);
 }
 
 export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
@@ -99,10 +100,12 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       gradeManual: false,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putSurvey(row);
     set({ revision: get().revision + 1 });
+    // 苗圃侧：按新测次把成活株数摊回批次、重算结算单（失败只重试苗圃侧）
+    await afterSurveySaved();
     return row;
   },
 
@@ -121,11 +124,15 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       survivalRate,
     });
     set({ revision: get().revision + 1 });
+    // 测次改了成活株数，苗圃侧结算单要按新口径重算（失败只重试苗圃侧）
+    await afterSurveySaved();
   },
 
   async deleteSurvey(surveyId) {
     await removeSurvey(surveyId);
     set({ selectedIds: get().selectedIds.filter((id) => id !== surveyId), revision: get().revision + 1 });
+    // 删除测次后结算依据可能落到上一测次，苗圃侧需要重算（失败只重试苗圃侧）
+    await afterSurveySaved();
   },
 
   async bulkApplyGrade(level) {
@@ -143,7 +150,9 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     if (!plot) return '地块不存在，无法生成补植计划';
     const missing = summary.suggestReplant;
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
-    const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
+    const { seedlings, plantings } = usePlotStore.getState();
+    const plotBatchId = plantings.find((row) => row.plotId === plotId)?.seedlingId;
+    const species = plotBatchId ? (seedlings.find((row) => row.id === plotBatchId)?.species ?? '秋茄') : '秋茄';
     const stamp = nowIso();
     await db.replants.put({
       id: uuid('replant'),
@@ -154,7 +163,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       state: '待补植',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     });
     set({ revision: get().revision + 1, lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` });
     return `已生成补植计划：缺株 ${missing} 株`;

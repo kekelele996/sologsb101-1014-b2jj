@@ -67,10 +67,20 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       snapshot: null,
     };
   }
-  const collections: Array<keyof DatabaseSnapshot> = ['plots', 'seedlings', 'plantings', 'surveys', 'replants'];
+  const collections: Array<keyof DatabaseSnapshot> = [
+    'plots',
+    'seedlings',
+    'plantings',
+    'surveys',
+    'replants',
+    'nurseryOutflows',
+    'settlements',
+    'outbox',
+  ];
   for (const key of collections) {
     if (!Array.isArray(data[key])) {
-      return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
+      // 旧版存档（v2 及以前）没有苗圃侧新表，导入时按空集合兜底
+      (data as Record<string, unknown>)[key] = [];
     }
   }
   return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
@@ -92,8 +102,9 @@ export function exportSummaryCsv(
     '修复方式',
     '状态',
     '苗木批次数',
-    '进场苗木合计(株)',
+    '已落实进场苗木(株)',
     '栽植总株数(株)',
+    '挂起待苗(株)',
     '测次数',
     '最新测次',
     '最新成活株数',
@@ -106,11 +117,14 @@ export function exportSummaryCsv(
   ];
   const lines: string[] = [header.map(csvCell).join(',')];
   plots.forEach((plot) => {
-    const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
-    const plotPlantings = plantings.filter((row) => row.plotId === plot.id);
+    const plotPlantingsAll = plantings.filter((row) => row.plotId === plot.id);
+    const plotBatchIds = new Set(plotPlantingsAll.map((row) => row.seedlingId));
+    const plotSeedlings = seedlings.filter((row) => plotBatchIds.has(row.id));
+    const plotPlantings = plotPlantingsAll;
     const plotSurveys = surveys.filter((row) => row.plotId === plot.id).sort((a, b) => a.round - b.round);
     const plotReplants = replants.filter((row) => row.plotId === plot.id);
-    const total = plotPlantings.reduce((acc, row) => acc + row.count, 0);
+    // 分母只算已落实领用（挂起部分尚未栽植）
+    const total = plotPlantings.reduce((acc, row) => acc + row.fulfilledCount, 0);
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
     const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
     lines.push(
@@ -122,8 +136,9 @@ export function exportSummaryCsv(
         plot.restoreMode,
         plot.state,
         plotSeedlings.length,
-        plotSeedlings.reduce((acc, row) => acc + row.quantity, 0),
+        plotPlantings.reduce((acc, row) => acc + row.fulfilledCount, 0),
         total,
+        plotPlantings.reduce((acc, row) => acc + Math.max(0, row.count - row.fulfilledCount), 0),
         plotSurveys.length,
         latest ? `第 ${latest.round} 测次` : '未验收',
         latest ? latest.aliveCount : 0,
@@ -176,7 +191,9 @@ export function buildSummaryText(
 ): string {
   const lines: string[] = [`【红树林修复成活率通报】共 ${plots.length} 个地块`];
   plots.forEach((plot) => {
-    const total = plantings.filter((row) => row.plotId === plot.id).reduce((acc, row) => acc + row.count, 0);
+    const total = plantings
+      .filter((row) => row.plotId === plot.id)
+      .reduce((acc, row) => acc + row.fulfilledCount, 0);
     const plotSurveys = surveys.filter((row) => row.plotId === plot.id).sort((a, b) => a.round - b.round);
     const latest = plotSurveys.length > 0 ? plotSurveys[plotSurveys.length - 1] : null;
     const rate = latest ? calcSurvivalRate(latest.aliveCount, total) : 0;
